@@ -3,6 +3,7 @@ from setuptools import setup
 APP = ['app.py']
 OPTIONS = {
     'argv_emulation': False,
+    'iconfile': 'GhostGauge.icns',
     'plist': {
         'CFBundleName': 'GhostGauge',
         'CFBundleDisplayName': 'GhostGauge',
