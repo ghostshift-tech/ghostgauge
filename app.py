@@ -22,7 +22,7 @@ from core import (
 
 REPO_URL = "https://github.com/ghostshift-tech/ghostgauge"
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Threshold constants for warning color + notification
 WARN_THRESHOLD = 85   # % at/above which usage is shown in warning color + notified
