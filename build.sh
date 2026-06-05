@@ -108,3 +108,10 @@ else
     echo "ERROR: dist/GhostGauge.app not found after build" >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# 7. Ad-hoc code-sign (stable identity for Keychain Always-Allow)
+# ---------------------------------------------------------------------------
+echo "==> Ad-hoc signing (stable identity for Keychain Always-Allow)…"
+codesign --force --deep --sign - "$APP_PATH" || echo "warn: codesign failed"
+codesign -dv "$APP_PATH" 2>&1 | head -3 || true

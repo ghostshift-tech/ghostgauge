@@ -660,6 +660,7 @@ def main_gui():
             self._last_result: dict | None = None
             self._last_refresh: datetime | None = None
             self._styling_enabled = _appkit_available()
+            self._token = None  # cached access token; read from Keychain once per launch
             self._do_refresh()
 
         def _build_session_bar_str(self, session_pct) -> str:
@@ -763,14 +764,25 @@ def main_gui():
 
         def _do_refresh(self):
             try:
-                token = get_access_token()
-                if token is None:
+                # Read Keychain only once per launch; re-read only on 401 (token rotation).
+                if self._token is None:
+                    self._token = get_access_token()
+                if self._token is None:
                     self.title = "⚠️ Claude: no token"
                     self._last_refresh = datetime.now().astimezone()
                     self._set_menu_message("Could not read Keychain item 'Claude Code-credentials'")
                     return
 
-                result = fetch_usage(token)
+                result = fetch_usage(self._token)
+
+                # On 401: token may have been rotated — evict cache and retry once.
+                if not result["ok"] and result["status_code"] == 401:
+                    self._token = None
+                    self._token = get_access_token()
+                    if self._token is not None:
+                        result = fetch_usage(self._token)
+                    # If still 401 (or no token), fall through to the error path below.
+
                 if not result["ok"]:
                     sc = result["status_code"]
                     if sc == 401:
