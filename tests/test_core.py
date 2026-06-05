@@ -182,9 +182,10 @@ class TestFindPlanName:
 # ---------------------------------------------------------------------------
 
 class FakeResponse:
-    def __init__(self, status_code: int, body: dict | None = None):
+    def __init__(self, status_code: int, body: dict | None = None, headers: dict | None = None):
         self.status_code = status_code
         self._body = body or {}
+        self.headers = headers or {}
 
     def json(self):
         return self._body
@@ -230,6 +231,30 @@ class TestFetchUsage:
         assert result["ok"] is False
         assert result["error"] == "rate_limited"
         assert result["status_code"] == 429
+        assert result["retry_after"] is None
+
+    def test_429_with_retry_after_integer_header(self, monkeypatch):
+        monkeypatch.setattr(
+            core.httpx, "get",
+            lambda *a, **kw: FakeResponse(429, headers={"Retry-After": "120"}),
+        )
+        result = core.fetch_usage("fake-token")
+
+        assert result["ok"] is False
+        assert result["error"] == "rate_limited"
+        assert result["status_code"] == 429
+        assert result["retry_after"] == 120
+
+    def test_429_without_retry_after_header(self, monkeypatch):
+        monkeypatch.setattr(
+            core.httpx, "get",
+            lambda *a, **kw: FakeResponse(429, headers={}),
+        )
+        result = core.fetch_usage("fake-token")
+
+        assert result["ok"] is False
+        assert result["status_code"] == 429
+        assert result["retry_after"] is None
 
     def test_request_error_returns_ok_false_status_none(self, monkeypatch):
         def raise_request_error(*a, **kw):

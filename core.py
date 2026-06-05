@@ -151,7 +151,19 @@ def fetch_usage(token: str) -> dict:
     if resp.status_code == 401:
         return {"ok": False, "error": "unauthorized", "status_code": 401}
     if resp.status_code == 429:
-        return {"ok": False, "error": "rate_limited", "status_code": 429}
+        raw_retry = resp.headers.get("Retry-After")
+        retry_after = None
+        if raw_retry is not None:
+            try:
+                retry_after = float(int(raw_retry))
+            except ValueError:
+                try:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(raw_retry)
+                    retry_after = max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+                except Exception:
+                    retry_after = None
+        return {"ok": False, "error": "rate_limited", "status_code": 429, "retry_after": retry_after}
     if resp.status_code != 200:
         return {"ok": False, "error": f"HTTP {resp.status_code}", "status_code": resp.status_code}
 

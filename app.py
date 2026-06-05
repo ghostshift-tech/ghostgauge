@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -516,6 +517,8 @@ def main_gui():
             self._styling_enabled = _appkit_available()
             self._token = None  # cached access token; read from Keychain once per launch
             self._notified: dict = {}  # per-window key → bool for notification hysteresis
+            self._backoff_until = None  # time.monotonic() deadline; None = not rate-limited
+            self._backoff_count = 0     # consecutive 429s for exponential backoff
             self._do_refresh()
 
         def _build_session_bar_str(self, session_pct) -> str:
@@ -658,6 +661,16 @@ def main_gui():
 
         def _do_refresh(self):
             try:
+                # Backoff gate: skip network call while still in the rate-limit window.
+                if self._backoff_until is not None:
+                    if time.monotonic() < self._backoff_until:
+                        remaining_min = int((self._backoff_until - time.monotonic()) // 60) + 1
+                        self._set_menu_message(f"Rate limited — retrying in ~{remaining_min} min")
+                        self.title = "⏳ rate limited"
+                        return
+                    else:
+                        self._backoff_until = None  # window elapsed, fall through and try again
+
                 # Read Keychain only once per launch; re-read only on 401 (token rotation).
                 if self._token is None:
                     self._token = get_access_token()
@@ -683,14 +696,22 @@ def main_gui():
                         self.title = "⚠️ Claude: re-auth"
                         self._set_menu_message("Token expired — run `claude` to re-authenticate")
                     elif sc == 429:
-                        self.title = "⏳ Claude: rate limited"
-                        self._set_menu_message("Rate limited — will retry automatically")
+                        base = result.get("retry_after")
+                        if base is None:
+                            base = min(120 * (2 ** self._backoff_count), 1800)
+                            self._backoff_count += 1
+                        self._backoff_until = time.monotonic() + float(base)
+                        wait_min = int(float(base) // 60) + 1
+                        self.title = "⏳ rate limited"
+                        self._set_menu_message(f"Rate limited — retrying in ~{wait_min} min")
                     else:
                         self.title = "⚠️ Claude"
                         self._set_menu_message(result["error"])
                     self._last_refresh = datetime.now().astimezone()
                     return
 
+                self._backoff_count = 0
+                self._backoff_until = None
                 self._last_result = result
                 self._last_refresh = datetime.now().astimezone()
                 self._apply_menubar_title(result)
@@ -779,6 +800,8 @@ def main_gui():
             self._do_refresh()
 
         def on_refresh(self, _sender):
+            self._backoff_until = None
+            self._backoff_count = 0
             self._do_refresh()
 
         def on_update(self, _sender):
