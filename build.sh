@@ -110,7 +110,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Ad-hoc code-sign (stable identity for Keychain Always-Allow)
+# 7. Record source repo path inside the bundle (must happen BEFORE codesign)
+# ---------------------------------------------------------------------------
+echo "==> Writing source_path.txt into bundle (before signing)..."
+echo "$PWD" > "$APP_PATH/Contents/Resources/source_path.txt"
+
+# ---------------------------------------------------------------------------
+# 8. Ad-hoc code-sign (stable identity for Keychain Always-Allow)
 # ---------------------------------------------------------------------------
 echo "==> Ad-hoc signing (stable identity for Keychain Always-Allow)…"
 codesign --force --deep --sign - "$APP_PATH" || echo "warn: codesign failed"

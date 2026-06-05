@@ -14,7 +14,7 @@ OPTIONS = {
     },
     'resources': ['assets/claude-color.svg'],
     'packages': ['rumps', 'httpx', 'keyring', 'certifi'],
-    'includes': ['keyring.backends.macOS', 'keyring.backends.SecretService',
+    'includes': ['core', 'keyring.backends.macOS', 'keyring.backends.SecretService',
                  'keyring.backends.chainer', 'keyring.backends.fail'],
 }
 setup(

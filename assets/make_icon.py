@@ -15,11 +15,10 @@ Layout:
 
 import math
 import os
-import sys
 
 import AppKit
-from Quartz import CoreGraphics
 from Foundation import NSMakePoint, NSMakeRect, NSMakeSize
+from Quartz import CoreGraphics
 
 
 def color(hex_str: str, alpha: float = 1.0) -> AppKit.NSColor:

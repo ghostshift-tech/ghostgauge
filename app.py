@@ -4,201 +4,28 @@
 # ///
 
 import argparse
-import getpass
-import json
 import os
+import shlex
+import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
-import httpx
-import keyring
+from core import (
+    _make_value_line,
+    fetch_usage,
+    format_reset_absolute,
+    format_reset_relative,
+    get_access_token,
+)
 
-USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-KEYCHAIN_SERVICE = "Claude Code-credentials"
-CREDENTIALS_FILE = Path.home() / ".claude" / ".credentials.json"
+REPO_URL = "https://github.com/ghostshift-tech/ghostgauge"
 
-HEADERS = {
-    "anthropic-beta": "oauth-2025-04-20",
-    "User-Agent": "claude-code/2.1.0",
-    "Accept": "application/json",
-}
+VERSION = "0.1.0"
 
-BAR_WIDTH = 14
-
-
-def get_access_token() -> str | None:
-    """Read OAuth access token from Keychain or fallback file. Never returns token material to caller logs."""
-    try:
-        raw = keyring.get_password(KEYCHAIN_SERVICE, getpass.getuser())
-    except Exception:
-        raw = None
-    if raw is None and CREDENTIALS_FILE.exists():
-        try:
-            raw = CREDENTIALS_FILE.read_text(encoding="utf-8")
-        except OSError:
-            return None
-    if raw is None:
-        return None
-    try:
-        data = json.loads(raw)
-        if "claudeAiOauth" in data:
-            return data["claudeAiOauth"]["accessToken"]
-        return data["accessToken"]
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
-def bar(pct: float, width: int = 10) -> str:
-    """Render a unicode block progress bar of given width (plain ASCII, used by --once mode)."""
-    pct = max(0, min(100, pct))
-    filled = round(pct / 100 * width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def extract_pct(window: dict) -> float | None:
-    """Try multiple key names for utilization percentage. Value is already 0-100."""
-    for key in ("utilization", "used_percentage", "used", "percentage"):
-        if key in window:
-            val = window[key]
-            try:
-                return round(float(val))
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def extract_reset(window: dict) -> str | None:
-    """Try multiple key names for reset time, return raw string or None."""
-    for key in ("resets_at", "reset_at", "resetsAt"):
-        if key in window:
-            return window[key]
-    return None
-
-
-def format_reset_relative(raw: str | None) -> str:
-    """Format reset time as relative delta for current-session (five_hour) window."""
-    if raw is None:
-        return "unknown"
-    try:
-        ts = raw
-        if ts.endswith("Z"):
-            ts = ts[:-1] + "+00:00"
-        dt_utc = datetime.fromisoformat(ts)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        delta_secs = (dt_utc - now).total_seconds()
-        if delta_secs <= 0:
-            return "resets soon"
-        delta_min = int(delta_secs // 60)
-        if delta_min < 1:
-            return "resets in <1 min"
-        if delta_min < 60:
-            return f"resets in {delta_min} min"
-        h = delta_min // 60
-        m = delta_min % 60
-        return f"resets in {h}h {m}m"
-    except Exception:
-        return "unknown"
-
-
-def format_reset_absolute(raw: str | None) -> str:
-    """Format reset time as absolute local weekday+time for weekly windows."""
-    if raw is None:
-        return "unknown"
-    try:
-        ts = raw
-        if ts.endswith("Z"):
-            ts = ts[:-1] + "+00:00"
-        dt_utc = datetime.fromisoformat(ts)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        dt_local = dt_utc.astimezone()
-        # %-I strips leading zero on hour (Linux/macOS)
-        return "resets " + dt_local.strftime("%a %-I:%M %p")
-    except Exception:
-        return "unknown"
-
-
-def find_plan_name(data: dict) -> str | None:
-    """
-    Best-effort: scan top-level response for a plan/tier/subscription field.
-    Returns the value as a string if found, None otherwise.
-    Never returns token material — only plan-shaped strings.
-    """
-    plan_keys = [k for k in data if any(word in k.lower() for word in ("plan", "tier", "subscription"))]
-    for k in plan_keys:
-        val = data[k]
-        if isinstance(val, str) and val:
-            return val
-    return None
-
-
-def fetch_usage(token: str) -> dict:
-    """
-    Returns dict with keys: ok, session_pct, session_reset_raw, week_pct, week_reset_raw,
-    sonnet_pct, sonnet_reset_raw, plan_name, top_level_keys, error, status_code.
-    sonnet_* keys are None when window is absent/null.
-    Never includes token material.
-    """
-    headers = {**HEADERS, "Authorization": f"Bearer {token}"}
-    try:
-        resp = httpx.get(USAGE_URL, headers=headers, timeout=30)
-    except httpx.RequestError as exc:
-        return {"ok": False, "error": str(exc), "status_code": None}
-
-    if resp.status_code == 401:
-        return {"ok": False, "error": "unauthorized", "status_code": 401}
-    if resp.status_code == 429:
-        return {"ok": False, "error": "rate_limited", "status_code": 429}
-    if resp.status_code != 200:
-        return {"ok": False, "error": f"HTTP {resp.status_code}", "status_code": resp.status_code}
-
-    try:
-        data = resp.json()
-    except Exception:
-        return {"ok": False, "error": "invalid response", "status_code": resp.status_code}
-
-    # Capture top-level keys (names only, no values — security rule)
-    top_level_keys = sorted(data.keys()) if isinstance(data, dict) else []
-
-    five_hour = data.get("five_hour") or {}
-    seven_day = data.get("seven_day") or {}
-    seven_day_sonnet = data.get("seven_day_sonnet") or {}
-
-    session_pct = extract_pct(five_hour)
-    session_reset_raw = extract_reset(five_hour)
-    week_pct = extract_pct(seven_day)
-    week_reset_raw = extract_reset(seven_day)
-
-    sonnet_pct = extract_pct(seven_day_sonnet) if seven_day_sonnet else None
-    sonnet_reset_raw = extract_reset(seven_day_sonnet) if seven_day_sonnet else None
-
-    plan_name = find_plan_name(data)
-
-    return {
-        "ok": True,
-        "session_pct": session_pct,
-        "session_reset_raw": session_reset_raw,
-        "week_pct": week_pct,
-        "week_reset_raw": week_reset_raw,
-        "sonnet_pct": sonnet_pct,
-        "sonnet_reset_raw": sonnet_reset_raw,
-        "plan_name": plan_name,
-        "top_level_keys": top_level_keys,
-        "status_code": 200,
-    }
-
-
-def _make_value_line(pct: int | None, reset_str: str) -> str:
-    """
-    Build the bar+pct+reset string for --once plain-text output.
-    Format: <10-char bar>  <3-char pct>%  · <reset>
-    """
-    b = bar(pct) if pct is not None else "░" * 10
-    pct_str = f"{pct:>3}%" if pct is not None else " n/a"
-    return f"{b}  {pct_str}  · {reset_str}"
+# Threshold constants for warning color + notification
+WARN_THRESHOLD = 85   # % at/above which usage is shown in warning color + notified
+WARN_RESET = 80       # hysteresis: must drop below this before it can alert again
 
 
 def run_once() -> int:
@@ -236,7 +63,7 @@ def run_once() -> int:
         plan_name = result["plan_name"]
         plan_header = f"Plan usage limits — {plan_name}" if plan_name else "Plan usage limits"
         print(plan_header)
-        print(f"  Current session")
+        print("  Current session")
         print(f"  {_make_value_line(int(s_pct) if s_pct is not None else None, s_reset)}")
         print()
         print("Weekly limits")
@@ -269,8 +96,9 @@ def _drawn_spark_image():
     """
     try:
         import math
-        from AppKit import NSImage, NSBezierPath, NSColor, NSGraphicsContext
-        from Foundation import NSMakeSize, NSMakePoint
+
+        from AppKit import NSBezierPath, NSColor, NSGraphicsContext, NSImage
+        from Foundation import NSMakePoint, NSMakeSize
 
         SIZE = 18.0
         NUM_RAYS = 12
@@ -386,6 +214,7 @@ def _claude_icon_image():
         _claude_icon_cache = img
     return img
 
+
 def _appkit_available() -> bool:
     """Return True if AppKit/Foundation are importable (always True on macOS with rumps installed)."""
     try:
@@ -413,7 +242,7 @@ def _ensure_appkit_classes() -> bool:
         return True
     try:
         import objc
-        from AppKit import NSView, NSColor, NSBezierPath
+        from AppKit import NSBezierPath, NSColor, NSView
         from Foundation import NSMakeRect
 
         _BAR_TRACK_WIDTH = 150.0
@@ -425,10 +254,14 @@ def _ensure_appkit_classes() -> bool:
                 self = objc.super(GhostGaugeBarView, self).initWithFrame_(frame)
                 if self is not None:
                     self._pct = 0.0
+                    self._warn = False
                 return self
 
             def setPct_(self, pct):
                 self._pct = max(0.0, min(100.0, float(pct)))
+
+            def setWarn_(self, warn: bool):
+                self._warn = bool(warn)
 
             def isFlipped(self):
                 return True
@@ -440,15 +273,21 @@ def _ensure_appkit_classes() -> bool:
                 NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                     track_rect, _BAR_CORNER, _BAR_CORNER
                 ).fill()
-                # Fill (orange, proportional)
-                claude_orange = NSColor.colorWithSRGBRed_green_blue_alpha_(
-                    215 / 255.0, 135 / 255.0, 95 / 255.0, 1.0
-                )
+                # Fill: warning red when at/above threshold, else Claude orange
+                warn_flag = getattr(self, "_warn", False)
+                if warn_flag:
+                    fill_color = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        224 / 255.0, 83 / 255.0, 63 / 255.0, 1.0
+                    )
+                else:
+                    fill_color = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        215 / 255.0, 135 / 255.0, 95 / 255.0, 1.0
+                    )
                 fill_w = _BAR_TRACK_WIDTH * self._pct / 100.0
                 if self._pct > 0 and fill_w < 3.0:
                     fill_w = 3.0
                 if fill_w > 0:
-                    claude_orange.set()
+                    fill_color.set()
                     fill_rect = NSMakeRect(0, 0, fill_w, _BAR_HEIGHT)
                     NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                         fill_rect, _BAR_CORNER, _BAR_CORNER
@@ -486,7 +325,7 @@ def _build_usage_panel(result: dict):
         if not _ensure_appkit_classes():
             return None
 
-        from AppKit import NSTextField, NSColor, NSFont
+        from AppKit import NSColor, NSFont, NSTextField
         from Foundation import NSMakeRect
 
         GhostGaugeBarView = _GhostGaugeBarView
@@ -518,6 +357,11 @@ def _build_usage_panel(result: dict):
         label_color = NSColor.labelColor()
         suffix_color = NSColor.secondaryLabelColor()
 
+        # ---- Warning color ----
+        warn_red = NSColor.colorWithSRGBRed_green_blue_alpha_(
+            224 / 255.0, 83 / 255.0, 63 / 255.0, 1.0
+        )
+
         # ---- Prepare data ----
         s_pct = result["session_pct"]
         w_pct = result["week_pct"]
@@ -536,11 +380,19 @@ def _build_usage_panel(result: dict):
         s_pct_int = int(s_pct) if s_pct is not None else 0
         w_pct_int = int(w_pct) if w_pct is not None else 0
 
+        s_warn = s_pct is not None and s_pct_int >= WARN_THRESHOLD
+        w_warn = w_pct is not None and w_pct_int >= WARN_THRESHOLD
+
+        s_suffix_color = warn_red if s_warn else suffix_color
+        w_suffix_color = warn_red if w_warn else suffix_color
+
         s_suffix = f"  {s_pct_int}% · {s_reset}" if s_pct is not None else f"  n/a · {s_reset}"
         w_suffix = f"  {w_pct_int}% · {w_reset}" if w_pct is not None else f"  n/a · {w_reset}"
 
         show_sonnet = sonnet_pct is not None and sonnet_reset is not None
         sonnet_pct_int = int(sonnet_pct) if sonnet_pct is not None else 0
+        sonnet_warn = show_sonnet and sonnet_pct_int >= WARN_THRESHOLD
+        sonnet_suffix_color = warn_red if sonnet_warn else suffix_color
         sonnet_suffix = (
             f"  {sonnet_pct_int}% · {sonnet_reset}" if show_sonnet else ""
         )
@@ -575,15 +427,17 @@ def _build_usage_panel(result: dict):
         )
 
         # ---- Helper: place a bar row (BarView + suffix label) ----
-        def add_bar_row(y: float, pct_int: int, suffix_text: str) -> float:
+        def add_bar_row(y: float, pct_int: int, suffix_text: str, warn: bool = False, sc=None) -> float:
             bar_y = y + (BAR_ROW_H - BAR_HEIGHT) / 2.0  # vertically center bar in row
             bv = GhostGaugeBarView.alloc().initWithFrame_(
                 NSMakeRect(H_PAD, bar_y, BAR_TRACK_WIDTH, BAR_HEIGHT)
             )
             bv.setPct_(float(pct_int))
+            bv.setWarn_(warn)
             panel.addSubview_(bv)
 
-            suffix_tf = make_label(suffix_text, suffix_color, suffix_font)
+            actual_suffix_color = sc if sc is not None else suffix_color
+            suffix_tf = make_label(suffix_text, actual_suffix_color, suffix_font)
             sx = H_PAD + BAR_TRACK_WIDTH + 6.0
             # vertically center suffix text in row
             suffix_frame = suffix_tf.frame()
@@ -614,7 +468,7 @@ def _build_usage_panel(result: dict):
         y += SMALL_GAP
 
         # Session bar row
-        y = add_bar_row(y, s_pct_int, s_suffix)
+        y = add_bar_row(y, s_pct_int, s_suffix, warn=s_warn, sc=s_suffix_color)
 
         y += SECTION_GAP
 
@@ -627,7 +481,7 @@ def _build_usage_panel(result: dict):
         y += SMALL_GAP
 
         # All models bar row
-        y = add_bar_row(y, w_pct_int, w_suffix)
+        y = add_bar_row(y, w_pct_int, w_suffix, warn=w_warn, sc=w_suffix_color)
 
         if show_sonnet:
             y += SONNET_GAP
@@ -637,7 +491,7 @@ def _build_usage_panel(result: dict):
             y += SMALL_GAP
 
             # Sonnet bar row
-            y = add_bar_row(y, sonnet_pct_int, sonnet_suffix)
+            y = add_bar_row(y, sonnet_pct_int, sonnet_suffix, warn=sonnet_warn, sc=sonnet_suffix_color)
 
         return panel
 
@@ -661,6 +515,7 @@ def main_gui():
             self._last_refresh: datetime | None = None
             self._styling_enabled = _appkit_available()
             self._token = None  # cached access token; read from Keychain once per launch
+            self._notified: dict = {}  # per-window key → bool for notification hysteresis
             self._do_refresh()
 
         def _build_session_bar_str(self, session_pct) -> str:
@@ -692,16 +547,26 @@ def main_gui():
 
             try:
                 from AppKit import (
-                    NSMutableAttributedString, NSAttributedString,
-                    NSColor, NSFont,
-                    NSForegroundColorAttributeName, NSFontAttributeName,
+                    NSColor,
+                    NSFont,
+                    NSFontAttributeName,
+                    NSForegroundColorAttributeName,
+                    NSMutableAttributedString,
                 )
                 from Foundation import NSRange
 
                 mono_font = NSFont.monospacedSystemFontOfSize_weight_(13.0, 0.0)
-                orange = NSColor.colorWithSRGBRed_green_blue_alpha_(
-                    215 / 255.0, 135 / 255.0, 95 / 255.0, 1.0
-                )
+
+                # Use warning red when at/above threshold, else Claude orange
+                session_warn = session_pct is not None and pct_int >= WARN_THRESHOLD
+                if session_warn:
+                    fill_color = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        224 / 255.0, 83 / 255.0, 63 / 255.0, 1.0
+                    )
+                else:
+                    fill_color = NSColor.colorWithSRGBRed_green_blue_alpha_(
+                        215 / 255.0, 135 / 255.0, 95 / 255.0, 1.0
+                    )
                 track_color = NSColor.tertiaryLabelColor()
 
                 full_text = bar_str + suffix
@@ -713,11 +578,11 @@ def main_gui():
                     NSFontAttributeName, mono_font, NSRange(0, total_len)
                 )
 
-                # Color filled cells (█) — orange
+                # Color filled cells (█) — fill_color (orange or warn red)
                 filled_count = bar_str.count("█")
                 if filled_count > 0:
                     astr.addAttribute_value_range_(
-                        NSForegroundColorAttributeName, orange, NSRange(0, filled_count)
+                        NSForegroundColorAttributeName, fill_color, NSRange(0, filled_count)
                     )
 
                 # Color track cells (░) — tertiaryLabel
@@ -729,11 +594,11 @@ def main_gui():
                         NSRange(filled_count, track_count),
                     )
 
-                # Color suffix — same Claude brand orange as filled cells
+                # Color suffix — same fill_color as filled cells (orange or warn red)
                 if len(suffix) > 0:
                     astr.addAttribute_value_range_(
                         NSForegroundColorAttributeName,
-                        orange,
+                        fill_color,
                         NSRange(len(bar_str), len(suffix)),
                     )
 
@@ -761,6 +626,35 @@ def main_gui():
             except Exception:
                 # Any AppKit failure — plain title already set above, just continue.
                 pass
+
+        def _check_threshold_notifications(self, result: dict):
+            """
+            Fire rumps notifications when any window crosses WARN_THRESHOLD.
+            Uses hysteresis: re-arms only when pct drops below WARN_RESET.
+            Wrapped in try/except — safe in dev/non-bundle mode.
+            """
+            windows = [
+                ("session", result.get("session_pct"), "Current session"),
+                ("week",    result.get("week_pct"),    "All models"),
+                ("sonnet",  result.get("sonnet_pct"),  "Sonnet"),
+            ]
+            for key, pct, label in windows:
+                if pct is None:
+                    continue
+                pct_int = int(pct)
+                if pct_int >= WARN_THRESHOLD and not self._notified.get(key, False):
+                    try:
+                        import rumps as _rumps
+                        _rumps.notification(
+                            "GhostGauge",
+                            f"{label} usage at {pct_int}%",
+                            "Approaching your limit",
+                        )
+                    except Exception:
+                        pass
+                    self._notified[key] = True
+                elif pct_int < WARN_RESET:
+                    self._notified[key] = False
 
         def _do_refresh(self):
             try:
@@ -800,6 +694,7 @@ def main_gui():
                 self._last_result = result
                 self._last_refresh = datetime.now().astimezone()
                 self._apply_menubar_title(result)
+                self._check_threshold_notifications(result)
                 self._rebuild_menu(result)
             except Exception:
                 self.title = "⚠️ Claude"
@@ -851,6 +746,10 @@ def main_gui():
             )
             items.append(rumps.MenuItem(last_updated_text))  # dim, no callback
             items.append(rumps.MenuItem("Refresh", callback=self.on_refresh))
+            items.append(rumps.MenuItem("Update GhostGauge", callback=self.on_update))
+            version_mi = rumps.MenuItem(f"GhostGauge v{VERSION}")
+            version_mi.set_callback(None)
+            items.append(version_mi)
             items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
             self.menu.clear()
@@ -862,12 +761,16 @@ def main_gui():
                 if self._last_refresh is not None
                 else "Last updated —"
             )
+            version_mi = rumps.MenuItem(f"GhostGauge v{VERSION}")
+            version_mi.set_callback(None)
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem(msg),
                 None,
                 rumps.MenuItem(last_updated_text),  # dim, no callback
                 rumps.MenuItem("Refresh", callback=self.on_refresh),
+                rumps.MenuItem("Update GhostGauge", callback=self.on_update),
+                version_mi,
                 rumps.MenuItem("Quit", callback=rumps.quit_application),
             ]
 
@@ -877,6 +780,35 @@ def main_gui():
 
         def on_refresh(self, _sender):
             self._do_refresh()
+
+        def on_update(self, _sender):
+            try:
+                # Resolve source repo path: bundle writes source_path.txt next to app.py
+                source_txt = Path(__file__).parent / "source_path.txt"
+                if source_txt.exists():
+                    content = source_txt.read_text(encoding="utf-8").strip()
+                    path = Path(content) if content else Path(__file__).parent
+                else:
+                    path = Path(__file__).parent
+
+                if path.exists() and (path / ".git").exists():
+                    inner = f"cd {shlex.quote(str(path))} && git pull && ./install.sh"
+                    as_escaped = inner.replace("\\", "\\\\").replace('"', '\\"')
+                    script = f'tell application "Terminal" to do script "{as_escaped}"'
+                    subprocess.run(["osascript", "-e", script], check=False)
+                else:
+                    subprocess.run(["open", REPO_URL], check=False)
+                    try:
+                        rumps.notification(
+                            "GhostGauge",
+                            "Update",
+                            "Source repo not found locally — opened the GitHub page. "
+                            "Pull and run install.command manually.",
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                subprocess.run(["open", REPO_URL], check=False)
 
     GhostGauge().run()
 
