@@ -43,7 +43,10 @@ A Terminal window builds the app and installs it to `/Applications`, then launch
 ./install.sh
 ```
 
-Both build a fresh `dist/GhostGauge.app` and copy it to `/Applications/GhostGauge.app`.
+Both build a fresh `dist/GhostGauge.app`, copy it to `/Applications/GhostGauge.app`,
+and register it as a **Login Item** so it starts automatically at login. (The first
+run may ask Terminal for Automation permission to add the login item — a one-time
+macOS prompt. Toggle it any time in **System Settings → General → Login Items**.)
 
 ## Run (development)
 

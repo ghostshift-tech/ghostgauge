@@ -34,10 +34,26 @@ rm -rf "$TARGET"
 cp -R dist/GhostGauge.app "$TARGET"
 
 # ---------------------------------------------------------------------------
-# 4. Launch
+# 4. Register as a Login Item (auto-start at login), idempotent
+#    Removes any existing "GhostGauge" entry first so it never duplicates.
+#    First run may ask Terminal for Automation permission to control
+#    System Events — that's a one-time macOS prompt.
+# ---------------------------------------------------------------------------
+echo "==> Registering Login Item (auto-start at login)..."
+osascript -e 'tell application "System Events" to delete (every login item whose name is "GhostGauge")' >/dev/null 2>&1 || true
+if osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/GhostGauge.app", hidden:false}' >/dev/null 2>&1; then
+  echo "    added to Login Items (System Settings → General → Login Items)"
+else
+  echo "    (could not register automatically — add it manually in"
+  echo "     System Settings → General → Login Items, or allow the Automation prompt and re-run)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Launch
 # ---------------------------------------------------------------------------
 echo "==> Launching GhostGauge..."
 open "$TARGET"
 
 echo ""
 echo "==> Install complete: $TARGET"
+echo "    GhostGauge will now start automatically at login."
