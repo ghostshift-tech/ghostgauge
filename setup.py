@@ -12,6 +12,7 @@ OPTIONS = {
         'CFBundleShortVersionString': '0.1.0',
         'LSUIElement': True,  # menubar-only, no Dock icon
     },
+    'resources': ['assets/claude-color.svg'],
     'packages': ['rumps', 'httpx', 'keyring', 'certifi'],
     'includes': ['keyring.backends.macOS', 'keyring.backends.SecretService',
                  'keyring.backends.chainer', 'keyring.backends.fail'],

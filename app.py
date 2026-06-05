@@ -6,6 +6,7 @@
 import argparse
 import getpass
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -260,27 +261,27 @@ def run_once() -> int:
 _claude_icon_cache = None
 
 
-def _claude_icon_image():
+def _drawn_spark_image():
     """
-    Build and return a 16x16 NSImage of a Claude-style sunburst (orange, ~11 spokes).
-    Cached in _claude_icon_cache after first call. Returns None on any failure.
-    Never called in --once mode.
+    Fallback: build and return an 18x18 NSImage of a Claude-style spark mark
+    (orange, 12 tapered rays) drawn via NSBezierPath.
+    Returns None on any failure. Never called in --once mode.
     """
-    global _claude_icon_cache
-    if _claude_icon_cache is not None:
-        return _claude_icon_cache
     try:
         import math
         from AppKit import NSImage, NSBezierPath, NSColor, NSGraphicsContext
-        from Foundation import NSMakeSize, NSMakePoint, NSZeroRect
+        from Foundation import NSMakeSize, NSMakePoint
 
-        SIZE = 18.0  # slightly larger backing for crispness, displayed at ~16 pt
-        NUM_SPOKES = 11
+        SIZE = 18.0
+        NUM_RAYS = 12
         CENTER = SIZE / 2.0
-        INNER_R = 2.8   # spoke starts near center
-        OUTER_R = 7.8   # spoke ends near edge
-        LINE_W = 1.7
-        ANGLE_STEP = 2 * math.pi / NUM_SPOKES
+        ANGLE_STEP = 2 * math.pi / NUM_RAYS
+
+        INNER_R = 2.2
+        OUTER_R_BASE = 7.6
+        OUTER_R_ALT = 6.8
+        LINE_W_INNER = 2.2
+        LINE_W_OUTER = 0.9
 
         image = NSImage.alloc().initWithSize_(NSMakeSize(SIZE, SIZE))
         image.lockFocus()
@@ -293,28 +294,97 @@ def _claude_icon_image():
             )
             orange.set()
 
-            path = NSBezierPath.bezierPath()
-            path.setLineWidth_(LINE_W)
-            path.setLineCapStyle_(1)  # NSRoundLineCapStyle = 1
+            for i in range(NUM_RAYS):
+                angle = i * ANGLE_STEP - math.pi / 2.0
+                outer_r = OUTER_R_BASE if i % 2 == 0 else OUTER_R_ALT
+                mid_r = INNER_R + (outer_r - INNER_R) * 0.45
 
-            for i in range(NUM_SPOKES):
-                angle = i * ANGLE_STEP - math.pi / 2.0  # start from top
-                x1 = CENTER + INNER_R * math.cos(angle)
-                y1 = CENTER + INNER_R * math.sin(angle)
-                x2 = CENTER + OUTER_R * math.cos(angle)
-                y2 = CENTER + OUTER_R * math.sin(angle)
-                path.moveToPoint_(NSMakePoint(x1, y1))
-                path.lineToPoint_(NSMakePoint(x2, y2))
+                x_start = CENTER + INNER_R * math.cos(angle)
+                y_start = CENTER + INNER_R * math.sin(angle)
+                x_mid = CENTER + mid_r * math.cos(angle)
+                y_mid = CENTER + mid_r * math.sin(angle)
 
-            path.stroke()
+                p_inner = NSBezierPath.bezierPath()
+                p_inner.setLineWidth_(LINE_W_INNER)
+                p_inner.setLineCapStyle_(1)  # NSRoundLineCapStyle
+                p_inner.moveToPoint_(NSMakePoint(x_start, y_start))
+                p_inner.lineToPoint_(NSMakePoint(x_mid, y_mid))
+                p_inner.stroke()
+
+                x_tip = CENTER + outer_r * math.cos(angle)
+                y_tip = CENTER + outer_r * math.sin(angle)
+
+                p_outer = NSBezierPath.bezierPath()
+                p_outer.setLineWidth_(LINE_W_OUTER)
+                p_outer.setLineCapStyle_(1)  # NSRoundLineCapStyle
+                p_outer.moveToPoint_(NSMakePoint(x_mid, y_mid))
+                p_outer.lineToPoint_(NSMakePoint(x_tip, y_tip))
+                p_outer.stroke()
+
         finally:
             image.unlockFocus()
 
         image.setTemplate_(False)
-        _claude_icon_cache = image
         return image
     except Exception:
         return None
+
+
+def _claude_icon_image():
+    """
+    Return an 18x18 NSImage for the menubar logo.
+
+    Priority:
+      1. Load claude-color.svg via NSImage (vector, color logo).
+         Candidate paths tried in order so this works in both run modes:
+         - Path(__file__).parent / "claude-color.svg"
+           (py2app bundle: script + resources both land in Contents/Resources)
+         - Path(__file__).parent / "assets" / "claude-color.svg"
+           (dev: repo root / assets/)
+         - $RESOURCEPATH / "claude-color.svg"  (explicit py2app env override)
+      2. Fall back to the hand-drawn spark (_drawn_spark_image()) on any failure.
+
+    Cached in _claude_icon_cache after first call. Returns None on any failure.
+    Never called in --once mode.
+    """
+    global _claude_icon_cache
+    if _claude_icon_cache is not None:
+        return _claude_icon_cache
+
+    # --- Attempt to load SVG ---
+    try:
+        from AppKit import NSImage
+        from Foundation import NSMakeSize
+
+        candidates = [
+            Path(__file__).parent / "claude-color.svg",
+            Path(__file__).parent / "assets" / "claude-color.svg",
+        ]
+        resource_path_env = os.environ.get("RESOURCEPATH", "")
+        if resource_path_env:
+            candidates.append(Path(resource_path_env) / "claude-color.svg")
+
+        svg_path = None
+        for candidate in candidates:
+            if candidate.exists():
+                svg_path = candidate
+                break
+
+        if svg_path is not None:
+            img = NSImage.alloc().initWithContentsOfFile_(str(svg_path))
+            if img is not None:
+                img.setSize_(NSMakeSize(18.0, 18.0))
+                img.setTemplate_(False)
+                _claude_icon_cache = img
+                return img
+    except Exception:
+        pass
+
+    # --- Fallback: drawn spark ---
+    img = _drawn_spark_image()
+    if img is not None:
+        _claude_icon_cache = img
+    return img
 
 def _appkit_available() -> bool:
     """Return True if AppKit/Foundation are importable (always True on macOS with rumps installed)."""
@@ -585,15 +655,16 @@ def main_gui():
     class GhostGauge(rumps.App):
         def __init__(self):
             super().__init__("Claude", title="⏳ Claude")
-            self.menu = ["Loading…", None, rumps.MenuItem("↻ Refresh", callback=self.on_refresh),
+            self.menu = ["Loading…", None, rumps.MenuItem("Refresh", callback=self.on_refresh),
                          rumps.MenuItem("Quit", callback=rumps.quit_application)]
             self._last_result: dict | None = None
+            self._last_refresh: datetime | None = None
             self._styling_enabled = _appkit_available()
             self._do_refresh()
 
         def _build_session_bar_str(self, session_pct) -> str:
-            """Return a 12-cell block bar string for the given session percentage."""
-            WIDTH = 12
+            """Return a 5-cell block bar string (each cell = 20%) for the given session percentage."""
+            WIDTH = 5
             if session_pct is None:
                 return "░" * WIDTH
             pct = max(0, min(100, int(session_pct)))
@@ -631,7 +702,6 @@ def main_gui():
                     215 / 255.0, 135 / 255.0, 95 / 255.0, 1.0
                 )
                 track_color = NSColor.tertiaryLabelColor()
-                label_color = NSColor.labelColor()
 
                 full_text = bar_str + suffix
                 astr = NSMutableAttributedString.alloc().initWithString_(full_text)
@@ -658,11 +728,11 @@ def main_gui():
                         NSRange(filled_count, track_count),
                     )
 
-                # Color suffix — labelColor
+                # Color suffix — same Claude brand orange as filled cells
                 if len(suffix) > 0:
                     astr.addAttribute_value_range_(
                         NSForegroundColorAttributeName,
-                        label_color,
+                        orange,
                         NSRange(len(bar_str), len(suffix)),
                     )
 
@@ -696,6 +766,7 @@ def main_gui():
                 token = get_access_token()
                 if token is None:
                     self.title = "⚠️ Claude: no token"
+                    self._last_refresh = datetime.now().astimezone()
                     self._set_menu_message("Could not read Keychain item 'Claude Code-credentials'")
                     return
 
@@ -711,13 +782,16 @@ def main_gui():
                     else:
                         self.title = "⚠️ Claude"
                         self._set_menu_message(result["error"])
+                    self._last_refresh = datetime.now().astimezone()
                     return
 
                 self._last_result = result
+                self._last_refresh = datetime.now().astimezone()
                 self._apply_menubar_title(result)
                 self._rebuild_menu(result)
             except Exception:
                 self.title = "⚠️ Claude"
+                self._last_refresh = datetime.now().astimezone()
                 self._set_menu_message("Refresh failed — try again")
 
         def _rebuild_menu(self, result: dict):
@@ -758,18 +832,30 @@ def main_gui():
                     ))
 
             items.append(None)  # separator
-            items.append(rumps.MenuItem("↻ Refresh", callback=self.on_refresh))
+            last_updated_text = (
+                f"Last updated {self._last_refresh.strftime('%-I:%M:%S %p')}"
+                if self._last_refresh is not None
+                else "Last updated —"
+            )
+            items.append(rumps.MenuItem(last_updated_text))  # dim, no callback
+            items.append(rumps.MenuItem("Refresh", callback=self.on_refresh))
             items.append(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
             self.menu.clear()
             self.menu = items
 
         def _set_menu_message(self, msg: str):
+            last_updated_text = (
+                f"Last updated {self._last_refresh.strftime('%-I:%M:%S %p')}"
+                if self._last_refresh is not None
+                else "Last updated —"
+            )
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem(msg),
                 None,
-                rumps.MenuItem("↻ Refresh", callback=self.on_refresh),
+                rumps.MenuItem(last_updated_text),  # dim, no callback
+                rumps.MenuItem("Refresh", callback=self.on_refresh),
                 rumps.MenuItem("Quit", callback=rumps.quit_application),
             ]
 
