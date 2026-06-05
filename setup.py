@@ -8,8 +8,8 @@ OPTIONS = {
         'CFBundleName': 'GhostGauge',
         'CFBundleDisplayName': 'GhostGauge',
         'CFBundleIdentifier': 'tech.ghostshift.ghostgauge',
-        'CFBundleVersion': '0.1.1',
-        'CFBundleShortVersionString': '0.1.1',
+        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.0.0',
         'LSUIElement': True,  # menubar-only, no Dock icon
     },
     'resources': ['assets/claude-color.svg'],
