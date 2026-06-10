@@ -18,6 +18,7 @@ from core import (
     format_reset_absolute,
     format_reset_relative,
     get_access_token,
+    get_plan_info,
 )
 
 REPO_URL = "https://github.com/ghostshift-tech/ghostgauge"
@@ -49,6 +50,13 @@ def run_once() -> int:
                 print(f"Error: {err}")
             return 1
 
+        # Fall back to credentials plan info if API didn't return a plan name
+        if not result.get("plan_name"):
+            try:
+                result["plan_name"] = get_plan_info()
+            except Exception:
+                pass
+
         # Print discovered top-level response keys (no values)
         print(f"[top-level response keys]: {result['top_level_keys']}")
         print(f"[plan_name field]: {result['plan_name']!r}")
@@ -59,7 +67,9 @@ def run_once() -> int:
         w_pct = result["week_pct"]
         w_reset = format_reset_absolute(result["week_reset_raw"])
         sonnet_pct = result["sonnet_pct"]
-        sonnet_reset = format_reset_absolute(result["sonnet_reset_raw"])
+        sonnet_reset_raw = result.get("sonnet_reset_raw")
+        opus_pct = result.get("opus_pct")
+        opus_reset_raw = result.get("opus_reset_raw")
 
         plan_name = result["plan_name"]
         plan_header = f"Plan usage limits — {plan_name}" if plan_name else "Plan usage limits"
@@ -71,7 +81,15 @@ def run_once() -> int:
         print("  All models")
         print(f"  {_make_value_line(int(w_pct) if w_pct is not None else None, w_reset)}")
 
-        if sonnet_pct is not None and sonnet_reset is not None:
+        # Opus row: only show when BOTH pct and reset_raw are present (matches GUI rule)
+        if opus_pct is not None and opus_reset_raw is not None:
+            opus_reset = format_reset_absolute(opus_reset_raw)
+            print("  Opus only")
+            print(f"  {_make_value_line(int(opus_pct), opus_reset)}")
+
+        # Sonnet row: only show when BOTH pct and reset_raw are present (matches GUI rule)
+        if sonnet_pct is not None and sonnet_reset_raw is not None:
+            sonnet_reset = format_reset_absolute(sonnet_reset_raw)
             print("  Sonnet only")
             print(f"  {_make_value_line(int(sonnet_pct), sonnet_reset)}")
 
@@ -319,6 +337,8 @@ def _build_usage_panel(result: dict):
         Weekly limits       (dim header)
         All models          (white label)
         [====bar====]  17% · resets Mon 1:59 PM
+        Opus only           (white label, only if present)
+        [====bar====]  5% · resets Mon 1:59 PM
         Sonnet only         (white label, only if present)
         [====bar====]  5% · resets Mon 1:59 PM
     """
@@ -367,12 +387,17 @@ def _build_usage_panel(result: dict):
         s_pct = result["session_pct"]
         w_pct = result["week_pct"]
         sonnet_pct = result["sonnet_pct"]
+        opus_pct = result.get("opus_pct")
 
         s_reset = format_reset_relative(result["session_reset_raw"])
         w_reset = format_reset_absolute(result["week_reset_raw"])
         sonnet_reset = (
             format_reset_absolute(result["sonnet_reset_raw"])
             if result.get("sonnet_reset_raw") else None
+        )
+        opus_reset = (
+            format_reset_absolute(result["opus_reset_raw"])
+            if result.get("opus_reset_raw") else None
         )
 
         plan_name = result.get("plan_name")
@@ -398,6 +423,14 @@ def _build_usage_panel(result: dict):
             f"  {sonnet_pct_int}% · {sonnet_reset}" if show_sonnet else ""
         )
 
+        show_opus = opus_pct is not None and opus_reset is not None
+        opus_pct_int = int(opus_pct) if opus_pct is not None else 0
+        opus_warn = show_opus and opus_pct_int >= WARN_THRESHOLD
+        opus_suffix_color = warn_red if opus_warn else suffix_color
+        opus_suffix = (
+            f"  {opus_pct_int}% · {opus_reset}" if show_opus else ""
+        )
+
         # ---- Layout constants ----
         TOP_PAD = 12.0
         BOTTOM_PAD = 12.0
@@ -417,6 +450,10 @@ def _build_usage_panel(result: dict):
         total_h += HEADER_H + SMALL_GAP           # "Weekly limits"
         total_h += LABEL_H + SMALL_GAP            # "All models"
         total_h += BAR_ROW_H                       # all-models bar row
+        if show_opus:
+            total_h += SONNET_GAP                  # gap before opus
+            total_h += LABEL_H + SMALL_GAP        # "Opus only"
+            total_h += BAR_ROW_H                   # opus bar row
         if show_sonnet:
             total_h += SONNET_GAP                  # gap before sonnet
             total_h += LABEL_H + SMALL_GAP        # "Sonnet only"
@@ -484,6 +521,16 @@ def _build_usage_panel(result: dict):
         # All models bar row
         y = add_bar_row(y, w_pct_int, w_suffix, warn=w_warn, sc=w_suffix_color)
 
+        if show_opus:
+            y += SONNET_GAP
+
+            # Opus only label
+            y = add_label(y, "Opus only", label_color, label_font, LABEL_H)
+            y += SMALL_GAP
+
+            # Opus bar row
+            y = add_bar_row(y, opus_pct_int, opus_suffix, warn=opus_warn, sc=opus_suffix_color)
+
         if show_sonnet:
             y += SONNET_GAP
 
@@ -519,6 +566,10 @@ def main_gui():
             self._notified: dict = {}  # per-window key → bool for notification hysteresis
             self._backoff_until = None  # time.monotonic() deadline; None = not rate-limited
             self._backoff_count = 0     # consecutive 429s for exponential backoff
+            try:
+                self._plan_info = get_plan_info()
+            except Exception:
+                self._plan_info = None
             self._do_refresh()
 
         def _build_session_bar_str(self, session_pct) -> str:
@@ -639,6 +690,7 @@ def main_gui():
             windows = [
                 ("session", result.get("session_pct"), "Current session"),
                 ("week",    result.get("week_pct"),    "All models"),
+                ("opus",    result.get("opus_pct"),    "Opus"),
                 ("sonnet",  result.get("sonnet_pct"),  "Sonnet"),
             ]
             for key, pct, label in windows:
@@ -665,8 +717,12 @@ def main_gui():
                 if self._backoff_until is not None:
                     if time.monotonic() < self._backoff_until:
                         remaining_min = int((self._backoff_until - time.monotonic()) // 60) + 1
-                        self._set_menu_message(f"Rate limited — retrying in ~{remaining_min} min")
-                        self.title = "⏳ rate limited"
+                        status_msg = f"Rate limited — retrying in ~{remaining_min} min"
+                        if self._last_result is not None:
+                            self._rebuild_menu(self._last_result, status_msg=status_msg)
+                        else:
+                            self._set_menu_message(status_msg)
+                            self.title = "⏳ rate limited"
                         return
                     else:
                         self._backoff_until = None  # window elapsed, fall through and try again
@@ -676,7 +732,6 @@ def main_gui():
                     self._token = get_access_token()
                 if self._token is None:
                     self.title = "⚠️ Claude: no token"
-                    self._last_refresh = datetime.now().astimezone()
                     self._set_menu_message("Could not read Keychain item 'Claude Code-credentials'")
                     return
 
@@ -693,6 +748,7 @@ def main_gui():
                 if not result["ok"]:
                     sc = result["status_code"]
                     if sc == 401:
+                        # 401 is always actionable — user must see it regardless of cached data
                         self.title = "⚠️ Claude: re-auth"
                         self._set_menu_message("Token expired — run `claude` to re-authenticate")
                     elif sc == 429:
@@ -702,13 +758,25 @@ def main_gui():
                             self._backoff_count += 1
                         self._backoff_until = time.monotonic() + float(base)
                         wait_min = int(float(base) // 60) + 1
-                        self.title = "⏳ rate limited"
-                        self._set_menu_message(f"Rate limited — retrying in ~{wait_min} min")
+                        status_msg = f"Rate limited — retrying in ~{wait_min} min"
+                        if self._last_result is not None:
+                            # Keep stale data visible; insert status line below "Last updated"
+                            self._rebuild_menu(self._last_result, status_msg=status_msg)
+                        else:
+                            self.title = "⏳ rate limited"
+                            self._set_menu_message(status_msg)
                     else:
-                        self.title = "⚠️ Claude"
-                        self._set_menu_message(result["error"])
-                    self._last_refresh = datetime.now().astimezone()
+                        status_msg = "Refresh failed — will retry"
+                        if self._last_result is not None:
+                            self._rebuild_menu(self._last_result, status_msg=status_msg)
+                        else:
+                            self.title = "⚠️ Claude"
+                            self._set_menu_message(result["error"])
                     return
+
+                # Successful fetch — fill in plan info from credentials if API didn't return one
+                if not result.get("plan_name") and self._plan_info:
+                    result["plan_name"] = self._plan_info
 
                 self._backoff_count = 0
                 self._backoff_until = None
@@ -719,10 +787,9 @@ def main_gui():
                 self._rebuild_menu(result)
             except Exception:
                 self.title = "⚠️ Claude"
-                self._last_refresh = datetime.now().astimezone()
                 self._set_menu_message("Refresh failed — try again")
 
-        def _rebuild_menu(self, result: dict):
+        def _rebuild_menu(self, result: dict, status_msg: str | None = None):
             panel = None
             if self._styling_enabled:
                 try:
@@ -742,6 +809,9 @@ def main_gui():
                 s_pct = result["session_pct"]
                 w_pct = result["week_pct"]
                 sonnet_pct = result["sonnet_pct"]
+                sonnet_reset_raw = result.get("sonnet_reset_raw")
+                opus_pct = result.get("opus_pct")
+                opus_reset_raw = result.get("opus_reset_raw")
                 s_reset = format_reset_relative(result["session_reset_raw"])
                 w_reset = format_reset_absolute(result["week_reset_raw"])
                 plan_name = result.get("plan_name")
@@ -753,10 +823,15 @@ def main_gui():
                 items.append(rumps.MenuItem(
                     f"  All models: {_make_value_line(int(w_pct) if w_pct is not None else None, w_reset)}"
                 ))
-                if sonnet_pct is not None:
-                    sonnet_reset = format_reset_absolute(result["sonnet_reset_raw"])
+                # Opus row: only show when BOTH pct and reset_raw are present (matches GUI rule)
+                if opus_pct is not None and opus_reset_raw is not None:
                     items.append(rumps.MenuItem(
-                        f"  Sonnet only: {_make_value_line(int(sonnet_pct), sonnet_reset)}"
+                        f"  Opus only: {_make_value_line(int(opus_pct), format_reset_absolute(opus_reset_raw))}"
+                    ))
+                # Sonnet row: only show when BOTH pct and reset_raw are present (matches GUI rule)
+                if sonnet_pct is not None and sonnet_reset_raw is not None:
+                    items.append(rumps.MenuItem(
+                        f"  Sonnet only: {_make_value_line(int(sonnet_pct), format_reset_absolute(sonnet_reset_raw))}"
                     ))
 
             items.append(None)  # separator
@@ -765,7 +840,14 @@ def main_gui():
                 if self._last_refresh is not None
                 else "Last updated —"
             )
-            items.append(rumps.MenuItem(last_updated_text))  # dim, no callback
+            last_updated_mi = rumps.MenuItem(last_updated_text)
+            last_updated_mi.set_callback(None)  # dim, same style as status line below
+            items.append(last_updated_mi)
+            # Insert status line (dim, no callback) right after "Last updated" when given
+            if status_msg is not None:
+                status_mi = rumps.MenuItem(status_msg)
+                status_mi.set_callback(None)
+                items.append(status_mi)
             items.append(rumps.MenuItem("Refresh", callback=self.on_refresh))
             items.append(rumps.MenuItem("Update GhostGauge", callback=self.on_update))
             version_mi = rumps.MenuItem(f"GhostGauge v{VERSION}")
@@ -784,11 +866,13 @@ def main_gui():
             )
             version_mi = rumps.MenuItem(f"GhostGauge v{VERSION}")
             version_mi.set_callback(None)
+            last_updated_mi = rumps.MenuItem(last_updated_text)
+            last_updated_mi.set_callback(None)  # dim, same style as version item
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem(msg),
                 None,
-                rumps.MenuItem(last_updated_text),  # dim, no callback
+                last_updated_mi,
                 rumps.MenuItem("Refresh", callback=self.on_refresh),
                 rumps.MenuItem("Update GhostGauge", callback=self.on_update),
                 version_mi,
@@ -802,6 +886,10 @@ def main_gui():
         def on_refresh(self, _sender):
             self._backoff_until = None
             self._backoff_count = 0
+            self._do_refresh()
+
+        def _on_wake(self):
+            """Called on system wake-from-sleep via rumps.events.on_wake."""
             self._do_refresh()
 
         def on_update(self, _sender):
@@ -833,7 +921,12 @@ def main_gui():
             except Exception:
                 subprocess.run(["open", REPO_URL], check=False)
 
-    GhostGauge().run()
+    app = GhostGauge()
+    try:
+        rumps.events.on_wake.register(app._on_wake)
+    except Exception:
+        pass
+    app.run()
 
 
 if __name__ == "__main__":

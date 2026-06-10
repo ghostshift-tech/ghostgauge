@@ -49,6 +49,18 @@ class TestBar:
         assert result.count("█") == 3
         assert result.count("░") == 7
 
+    def test_min_fill_nonzero_pct(self):
+        # 3% of 10 = 0.3 → rounds to 0, but pct > 0 so minimum 1 filled cell
+        result = core.bar(3, width=10)
+        assert result.count("█") == 1
+        assert result.count("░") == 9
+
+    def test_zero_pct_stays_empty(self):
+        # pct == 0 → no minimum fill
+        result = core.bar(0, width=10)
+        assert result.count("█") == 0
+        assert result == "░" * 10
+
 
 # ---------------------------------------------------------------------------
 # extract_pct()
@@ -307,3 +319,190 @@ class TestFetchUsage:
         # Token must never appear in any result value
         for v in result.values():
             assert secret not in str(v)
+
+    def test_opus_window_parsed_when_present(self, monkeypatch):
+        body = {
+            "five_hour": {"utilization": 40, "resets_at": "2099-12-31T23:59:59Z"},
+            "seven_day": {"utilization": 17, "resets_at": "2099-12-31T23:59:59Z"},
+            "seven_day_opus": {"utilization": 12, "resets_at": "2099-12-31T23:59:59Z"},
+        }
+        monkeypatch.setattr(core.httpx, "get", lambda *a, **kw: FakeResponse(200, body))
+        result = core.fetch_usage("fake-token")
+
+        assert result["opus_pct"] == 12
+        assert result["opus_reset_raw"] == "2099-12-31T23:59:59Z"
+
+    def test_opus_window_absent_gives_none(self, monkeypatch):
+        body = {
+            "five_hour": {"utilization": 40, "resets_at": "2099-12-31T23:59:59Z"},
+            "seven_day": {"utilization": 17, "resets_at": "2099-12-31T23:59:59Z"},
+        }
+        monkeypatch.setattr(core.httpx, "get", lambda *a, **kw: FakeResponse(200, body))
+        result = core.fetch_usage("fake-token")
+
+        assert result["opus_pct"] is None
+        assert result["opus_reset_raw"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_plan_info() — monkeypatched _read_raw_credentials
+# ---------------------------------------------------------------------------
+
+class TestGetPlanInfo:
+    def test_max_with_5x_tier(self, monkeypatch):
+        inner = '"accessToken": "secret-tok", "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x"'
+        raw = f'{{"claudeAiOauth": {{{inner}}}}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result == "Max 5x"
+
+    def test_subscription_type_only_no_tier(self, monkeypatch):
+        raw = '{"claudeAiOauth": {"accessToken": "secret-tok", "subscriptionType": "max"}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result == "Max"
+
+    def test_pro_plan(self, monkeypatch):
+        inner = '"accessToken": "secret-tok", "subscriptionType": "pro", "rateLimitTier": "default_claude_pro"'
+        raw = f'{{"claudeAiOauth": {{{inner}}}}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result == "Pro"
+
+    def test_no_subscription_type_returns_none(self, monkeypatch):
+        raw = '{"claudeAiOauth": {"accessToken": "secret-tok"}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result is None
+
+    def test_raw_none_returns_none(self, monkeypatch):
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: None)
+        result = core.get_plan_info()
+        assert result is None
+
+    def test_flat_json_without_wrapper(self, monkeypatch):
+        inner = '"accessToken": "secret-tok", "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x"'
+        raw = f'{{{inner}}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result == "Max 5x"
+
+    def test_never_returns_token_value(self, monkeypatch):
+        token_value = "super-secret-access-token"
+        inner = f'"accessToken": "{token_value}", "subscriptionType": "max", "rateLimitTier": "default_claude_max_5x"'
+        raw = f'{{"claudeAiOauth": {{{inner}}}}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result is not None
+        assert token_value not in str(result)
+
+    def test_multiplier_with_different_value(self, monkeypatch):
+        inner = '"accessToken": "tok", "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"'
+        raw = f'{{"claudeAiOauth": {{{inner}}}}}'
+        monkeypatch.setattr(core, "_read_raw_credentials", lambda: raw)
+        result = core.get_plan_info()
+        assert result == "Max 20x"
+
+
+# ---------------------------------------------------------------------------
+# get_access_token() — monkeypatched subprocess / keyring / filesystem
+# ---------------------------------------------------------------------------
+
+class FakeCompletedProcess:
+    def __init__(self, returncode: int, stdout: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class TestGetAccessToken:
+    def test_security_cli_success(self, monkeypatch):
+        """Security CLI returns credentials → token parsed, keyring never consulted."""
+        monkeypatch.setattr(core.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            core.subprocess,
+            "run",
+            lambda *a, **kw: FakeCompletedProcess(0, '{"claudeAiOauth": {"accessToken": "tok-cli"}}\n'),
+        )
+        def _keyring_must_not_be_called(*a, **kw):
+            raise AssertionError("keyring must not be called")
+
+        monkeypatch.setattr(core.keyring, "get_password", _keyring_must_not_be_called)
+
+        assert core.get_access_token() == "tok-cli"
+
+    def test_security_cli_nonzero_falls_back_to_keyring(self, monkeypatch):
+        """Security CLI exits non-zero → keyring fallback used."""
+        monkeypatch.setattr(core.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            core.subprocess,
+            "run",
+            lambda *a, **kw: FakeCompletedProcess(1, ""),
+        )
+        monkeypatch.setattr(
+            core.keyring,
+            "get_password",
+            lambda *a, **kw: '{"accessToken": "tok-keyring"}',
+        )
+
+        assert core.get_access_token() == "tok-keyring"
+
+    def test_security_cli_raises_falls_back_to_keyring(self, monkeypatch):
+        """Security CLI raises FileNotFoundError → keyring fallback used."""
+        monkeypatch.setattr(core.sys, "platform", "darwin")
+
+        def raise_fnf(*a, **kw):
+            raise FileNotFoundError("no such file")
+
+        monkeypatch.setattr(core.subprocess, "run", raise_fnf)
+        monkeypatch.setattr(
+            core.keyring,
+            "get_password",
+            lambda *a, **kw: '{"accessToken": "tok-keyring"}',
+        )
+
+        assert core.get_access_token() == "tok-keyring"
+
+    def test_non_darwin_skips_security_cli(self, monkeypatch):
+        """On non-darwin platform, subprocess.run is never called; keyring is used."""
+        monkeypatch.setattr(core.sys, "platform", "linux")
+        monkeypatch.setattr(
+            core.subprocess,
+            "run",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("subprocess.run must not be called on non-darwin")),
+        )
+        monkeypatch.setattr(
+            core.keyring,
+            "get_password",
+            lambda *a, **kw: '{"accessToken": "tok-keyring"}',
+        )
+
+        assert core.get_access_token() == "tok-keyring"
+
+    def test_all_fail_falls_back_to_file(self, monkeypatch, tmp_path):
+        """Security CLI non-zero, keyring None → reads from credentials file."""
+        monkeypatch.setattr(core.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            core.subprocess,
+            "run",
+            lambda *a, **kw: FakeCompletedProcess(1, ""),
+        )
+        monkeypatch.setattr(core.keyring, "get_password", lambda *a, **kw: None)
+
+        creds_file = tmp_path / ".credentials.json"
+        creds_file.write_text('{"claudeAiOauth": {"accessToken": "tok-file"}}', encoding="utf-8")
+        monkeypatch.setattr(core, "CREDENTIALS_FILE", creds_file)
+
+        assert core.get_access_token() == "tok-file"
+
+    def test_everything_fails_returns_none(self, monkeypatch, tmp_path):
+        """All sources fail (file missing) → returns None."""
+        monkeypatch.setattr(core.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            core.subprocess,
+            "run",
+            lambda *a, **kw: FakeCompletedProcess(1, ""),
+        )
+        monkeypatch.setattr(core.keyring, "get_password", lambda *a, **kw: None)
+        monkeypatch.setattr(core, "CREDENTIALS_FILE", tmp_path / ".credentials.json")
+
+        assert core.get_access_token() is None
